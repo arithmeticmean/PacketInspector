@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Install / remove the rules that feed packets to NFQUEUE, for both address
+# families. Paths and defaults are substituted by CMake at configure time.
+#
+#   sudo ./nfqueue.sh up      [queue-num]
+#   sudo ./nfqueue.sh down    [queue-num]
+#   sudo ./nfqueue.sh status  [queue-num]
+#
+# Environment:
+#   PORTS=443,8443   TCP destination ports to inspect   (MODE=ports only)
+#   MODE=ports       what to send to the queue:
+#                      ports  -- TCP traffic to PORTS. Inherently
+#                                client->server (nothing replies *to* 443) and
+#                                by far the least traffic: the queue only sees
+#                                what the inspector can actually act on.
+#                      ctdir  -- every connection's client->server direction,
+#                                any protocol, any port. Catches TLS on
+#                                non-standard ports, at the cost of copying all
+#                                forwarded traffic to userspace and of needing
+#                                conntrack (whose own table becomes a limit at
+#                                high connection rates).
+#
+# The rules live in a dedicated PACKETINSPECTOR chain that FORWARD jumps to, so
+# `up` is idempotent (the chain is refilled, never duplicated), a MODE change
+# just rewrites it, and `down` removes everything regardless of what was there.
+#
+# --queue-bypass: if no userspace program is bound to the queue, packets are
+# ACCEPTed instead of dropped, so forwarding keeps working when the tool is off.
+set -euo pipefail
+
+IPTABLES="@IPTABLES_EXECUTABLE@"
+IP6TABLES="@IP6TABLES_EXECUTABLE@"
+CHAIN="PACKETINSPECTOR"
+
+QUEUE_NUM="${QUEUE_NUM:-0}"
+PORTS="${PORTS:-@NFQUEUE_TLS_PORTS@}"
+MODE="${MODE:-ports}"
+
+usage() {
+  echo "usage: $0 {up|down|status} [queue-num]" >&2
+  exit 1
+}
+
+[[ $# -ge 1 ]] || usage
+[[ $# -ge 2 ]] && QUEUE_NUM="$2"
+
+if [[ "$1" != "status" && $EUID -ne 0 ]]; then
+  echo "must run as root (CAP_NET_ADMIN)" >&2
+  exit 1
+fi
+
+case "$MODE" in
+  ports) MATCH=(-p tcp -m multiport --dports "$PORTS") ;;
+  ctdir) MATCH=(-m conntrack --ctdir ORIGINAL) ;;
+  *) echo "unknown MODE '$MODE' (expected 'ports' or 'ctdir')" >&2; exit 1 ;;
+esac
+
+# Every family we can actually manage. IPv6 is skipped with a warning rather
+# than failing: the inspector parses IPv6, so a missing ip6tables means that
+# traffic silently bypasses it, and that is worth saying out loud.
+families() {
+  echo "4 $IPTABLES"
+  if [[ -n "$IP6TABLES" ]]; then
+    echo "6 $IP6TABLES"
+  fi
+}
+
+warn_no_ipv6() {
+  if [[ -z "$IP6TABLES" ]]; then
+    echo "warning: ip6tables not found at build time -- IPv6 traffic is NOT" \
+         "being inspected" >&2
+  fi
+}
+
+up_one() {
+  local ver="$1" bin="$2"
+  "$bin" -N "$CHAIN" 2>/dev/null || true # already exists: fine
+  "$bin" -F "$CHAIN"                     # refill from scratch
+  "$bin" -A "$CHAIN" "${MATCH[@]}" -j NFQUEUE \
+      --queue-num "$QUEUE_NUM" --queue-bypass
+  if ! "$bin" -C FORWARD -j "$CHAIN" 2>/dev/null; then
+    "$bin" -I FORWARD -j "$CHAIN"
+  fi
+  echo "IPv$ver: FORWARD -> $CHAIN -> NFQUEUE $QUEUE_NUM (MODE=$MODE)"
+}
+
+down_one() {
+  local ver="$1" bin="$2"
+  # A loop, not a single -D: an earlier run may have left more than one jump.
+  while "$bin" -C FORWARD -j "$CHAIN" 2>/dev/null; do
+    "$bin" -D FORWARD -j "$CHAIN"
+  done
+  "$bin" -F "$CHAIN" 2>/dev/null || true
+  "$bin" -X "$CHAIN" 2>/dev/null || true
+  echo "IPv$ver: $CHAIN removed"
+}
+
+status_one() {
+  local ver="$1" bin="$2"
+  echo "--- IPv$ver ---"
+  if "$bin" -C FORWARD -j "$CHAIN" 2>/dev/null; then
+    echo "FORWARD jumps to $CHAIN"
+  else
+    echo "FORWARD does NOT jump to $CHAIN (inspector is not receiving traffic)"
+  fi
+  "$bin" -S "$CHAIN" 2>/dev/null || echo "$CHAIN: absent"
+}
+
+case "$1" in
+  up)
+    warn_no_ipv6
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+    while read -r ver bin; do up_one "$ver" "$bin"; done < <(families)
+    ;;
+  down)
+    while read -r ver bin; do down_one "$ver" "$bin"; done < <(families)
+    ;;
+  status)
+    warn_no_ipv6
+    while read -r ver bin; do status_one "$ver" "$bin"; done < <(families)
+    ;;
+  *) usage ;;
+esac

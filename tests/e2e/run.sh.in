@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# End-to-end test: real TLS over real routed traffic through the real inspector.
+#
+#   sudo ./e2e/run.sh [-v]
+#
+# The client is curl and the server is openssl s_server -- both do TLS better
+# than anything worth writing for a test, and neither needs building. curl's
+# --resolve is what makes this work without DNS: it connects to the server's IP
+# but puts the given name in SNI, which is exactly the thing under test.
+#
+# The inspector's rule lives in the FORWARD chain, so loopback traffic would
+# never reach it. This builds an actual routed path out of three namespaces:
+#
+#     pi-e2e-cli                pi-e2e-rtr                pi-e2e-srv
+#   ┌────────────┐   veth   ┌──────────────────┐   veth   ┌────────────┐
+#   │   curl     ├──────────┤ forwards + rules ├──────────┤  s_server  │
+#   │ 10.99.1.2  │          │ .1.1        .2.1 │          │ 10.99.2.2  │
+#   └────────────┘          └────────┬─────────┘          └────────────┘
+#                                    │ NFQUEUE
+#                              PacketInspector
+#
+# Addresses, rules and processes all live inside those namespaces, so this never
+# touches the host's networking or firewall.
+#
+# Requires root: creating namespaces and veth pairs, and writing iptables rules.
+set -euo pipefail
+
+INSPECTOR="@PACKETINSPECTOR_BIN@"
+NFQUEUE_SH="@NFQUEUE_SH@"
+
+CLI_NS=pi-e2e-cli
+RTR_NS=pi-e2e-rtr
+SRV_NS=pi-e2e-srv
+
+CLI_IP=10.99.1.2
+RTR_CLI_IP=10.99.1.1
+SRV_IP=10.99.2.2
+RTR_SRV_IP=10.99.2.1
+
+PORT=8443
+QUEUE=100
+TIMEOUT=4
+
+VERBOSE=0
+[[ "${1:-}" == "-v" ]] && VERBOSE=1
+
+SRV_PID=""
+DPI_PID=""
+FAILURES=0
+
+# --- output ---------------------------------------------------------------
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+info()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+pass() { green "  PASS  $*"; }
+fail() { red   "  FAIL  $*"; FAILURES=$((FAILURES + 1)); }
+
+# --- preflight ------------------------------------------------------------
+#
+# Everything that can rule the run out happens before any state is created, so a
+# refusal leaves nothing behind to clean up.
+
+if [[ $EUID -ne 0 ]]; then
+  red "must run as root: this creates network namespaces and iptables rules"
+  echo "  sudo $0" >&2
+  exit 1
+fi
+
+for bin in "$INSPECTOR" "$NFQUEUE_SH"; do
+  if [[ ! -x "$bin" ]]; then
+    red "missing or not executable: $bin"
+    echo "  build it with: cmake -B build -DPACKET_BUILD_E2E=ON && cmake --build build" >&2
+    exit 1
+  fi
+done
+
+for tool in ip iptables openssl curl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    red "required tool not found: $tool"
+    exit 1
+  fi
+done
+
+# --- lifecycle ------------------------------------------------------------
+
+WORKDIR=$(mktemp -d)
+
+cleanup() {
+  local rc=$?
+  set +e
+  [[ -n "$DPI_PID" ]] && kill "$DPI_PID" 2>/dev/null
+  [[ -n "$SRV_PID" ]] && kill "$SRV_PID" 2>/dev/null
+  wait 2>/dev/null
+  for ns in "$CLI_NS" "$RTR_NS" "$SRV_NS"; do
+    ip netns del "$ns" 2>/dev/null # takes its veths with it
+  done
+  if [[ $VERBOSE -eq 1 || $rc -ne 0 || $FAILURES -ne 0 ]]; then
+    echo
+    info "logs in $WORKDIR (kept)"
+    for f in "$WORKDIR"/*.log; do
+      [[ -e "$f" ]] || continue
+      echo "--- $f ---"
+      sed 's/^/    /' "$f"
+    done
+  else
+    rm -rf "$WORKDIR"
+  fi
+  return $rc
+}
+trap cleanup EXIT
+
+# --- topology -------------------------------------------------------------
+
+info "building namespaces"
+for ns in "$CLI_NS" "$RTR_NS" "$SRV_NS"; do
+  ip netns del "$ns" 2>/dev/null || true # from an interrupted earlier run
+  ip netns add "$ns"
+  ip netns exec "$ns" ip link set lo up
+done
+
+ip link add vcli type veth peer name vcli-r
+ip link set vcli netns "$CLI_NS"
+ip link set vcli-r netns "$RTR_NS"
+
+ip link add vsrv type veth peer name vsrv-r
+ip link set vsrv netns "$SRV_NS"
+ip link set vsrv-r netns "$RTR_NS"
+
+ip netns exec "$CLI_NS" ip addr add "$CLI_IP/24" dev vcli
+ip netns exec "$CLI_NS" ip link set vcli up
+ip netns exec "$CLI_NS" ip route add default via "$RTR_CLI_IP"
+
+ip netns exec "$SRV_NS" ip addr add "$SRV_IP/24" dev vsrv
+ip netns exec "$SRV_NS" ip link set vsrv up
+ip netns exec "$SRV_NS" ip route add default via "$RTR_SRV_IP"
+
+ip netns exec "$RTR_NS" ip addr add "$RTR_CLI_IP/24" dev vcli-r
+ip netns exec "$RTR_NS" ip link set vcli-r up
+ip netns exec "$RTR_NS" ip addr add "$RTR_SRV_IP/24" dev vsrv-r
+ip netns exec "$RTR_NS" ip link set vsrv-r up
+ip netns exec "$RTR_NS" sysctl -qw net.ipv4.ip_forward=1
+
+# --- fixtures -------------------------------------------------------------
+
+info "generating certificate and blocklist"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "$WORKDIR/key.pem" -out "$WORKDIR/cert.pem" \
+    -subj "/CN=e2e.test" >/dev/null 2>&1
+
+cat > "$WORKDIR/blocklist.txt" <<'EOF'
+# exact match
+blocked.example.test
+# wildcard: any subdomain, but not the apex
+*.evil.example.test
+EOF
+
+# --- helpers --------------------------------------------------------------
+
+# A fresh server for every request, because a blocked flow leaves the previous
+# one wedged: once a flow is blocked EVERY packet of it is dropped, including
+# the client's FIN, so the server never learns the connection went away and sits
+# in its handshake until TCP gives up. That is correct inspector behaviour, and
+# any single-threaded server will hang on it -- so we restart rather than let a
+# blocked case poison the one after it.
+start_server() {
+  ip netns exec "$SRV_NS" openssl s_server -accept "$PORT" \
+      -cert "$WORKDIR/cert.pem" -key "$WORKDIR/key.pem" -www -quiet \
+      >> "$WORKDIR/server.log" 2>&1 &
+  SRV_PID=$!
+  for _ in $(seq 30); do
+    ip netns exec "$SRV_NS" ss -ltn 2>/dev/null | grep -q ":$PORT" && return 0
+    sleep 0.1
+  done
+  sleep 0.5 # no ss available: fall back to a fixed settle
+}
+
+stop_server() {
+  [[ -n "$SRV_PID" ]] && kill "$SRV_PID" 2>/dev/null
+  wait "$SRV_PID" 2>/dev/null || true
+  SRV_PID=""
+}
+
+# Fetch over TLS with `sni` in the SNI extension, and echo curl's exit code.
+#   0   connected, handshake completed, page fetched
+#   28  timed out -- TCP was fine, the ClientHello was dropped (a block)
+#   7   TCP connect failed -- blocked at the SYN, or the path is broken
+# Asserting 28 rather than merely "nonzero" is what pins the block to the
+# ClientHello; a 7 would mean it happened at the wrong layer.
+probe() {
+  local sni="$1"
+  start_server
+  set +e
+  ip netns exec "$CLI_NS" curl -sS -k \
+      --max-time "$TIMEOUT" --connect-timeout 3 \
+      --resolve "$sni:$PORT:$SRV_IP" "https://$sni:$PORT/" \
+      -o /dev/null >> "$WORKDIR/curl.log" 2>&1
+  local rc=$?
+  set -e
+  stop_server
+  echo "$rc"
+}
+
+expect() {
+  local what="$1" want="$2" got="$3"
+  if [[ "$got" == "$want" ]]; then
+    pass "$what"
+  elif [[ "$got" == "7" ]]; then
+    fail "$what (blocked at the SYN, not the ClientHello -- curl exit 7)"
+  else
+    fail "$what (expected curl exit $want, got $got)"
+  fi
+}
+
+# --- 1. baseline: the path itself works -----------------------------------
+#
+# Before the inspector exists. --queue-bypass makes an unbound queue ACCEPT, so
+# this proves the topology is sound. Without it, a broken route would look
+# exactly like a successful block.
+
+info "baseline: rules installed, inspector not running"
+ip netns exec "$RTR_NS" env PORTS="$PORT" MODE=ports \
+    "$NFQUEUE_SH" up "$QUEUE" > "$WORKDIR/rules.log" 2>&1
+expect "plain connection succeeds with the queue unbound" 0 \
+       "$(probe allowed.example.test)"
+
+# --- 2. with the inspector attached ---------------------------------------
+
+info "starting PacketInspector in $RTR_NS (queue $QUEUE)"
+# -v because the checks below read the inspector's own account of each verdict;
+# per-flow logging is off by default and this test depends on it.
+ip netns exec "$RTR_NS" "$INSPECTOR" -nfq "$QUEUE" -v \
+    -b "$WORKDIR/blocklist.txt" > "$WORKDIR/dpi.log" 2>&1 &
+DPI_PID=$!
+sleep 1
+if ! kill -0 "$DPI_PID" 2>/dev/null; then
+  red "PacketInspector exited immediately"
+  exit 1
+fi
+
+expect "allowed host connects"                      0  "$(probe allowed.example.test)"
+expect "exact-match blocked host cannot connect"    28  "$(probe blocked.example.test)"
+expect "wildcard-blocked subdomain cannot connect"  28  "$(probe a.evil.example.test)"
+expect "wildcard apex is not blocked"                0  "$(probe evil.example.test)"
+expect "allowed host still connects after blocks"    0  "$(probe another.example.test)"
+
+# The inspector's own account of what it did must agree with what curl saw.
+info "checking inspector decisions"
+check_log() {
+  local want="$1" host="$2"
+  if grep -qE "^$want $host\$" "$WORKDIR/dpi.log"; then
+    pass "inspector logged $want for $host"
+  else
+    fail "inspector did not log $want for $host"
+  fi
+}
+check_log BLOCK blocked.example.test
+check_log BLOCK a.evil.example.test
+check_log ALLOW evil.example.test
+check_log ALLOW another.example.test
+
+# --- report ---------------------------------------------------------------
+
+echo
+if [[ $FAILURES -eq 0 ]]; then
+  green "e2e: all checks passed"
+else
+  red "e2e: $FAILURES check(s) failed"
+  exit 1
+fi
