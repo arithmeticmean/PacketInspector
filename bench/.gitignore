@@ -1,0 +1,29 @@
+# The traffic generator. Unpacked by hand per the README, ~825 MB, and pinned
+# to a version in traffic_generator.py:
+#   wget -P trex https://trex-tgn.cisco.com/trex/release/v3.08.tar.gz
+#   tar -xzf trex/v3.08.tar.gz -C trex
+trex/
+*.tar.gz
+
+# Benchmark output: one directory per run, holding the report, the CSV, the
+# generated generator config, the blocklist, and the raw counter dumps.
+# Tens of megabytes per run.
+results/
+.run/
+
+# Python.
+__pycache__/
+*.py[oc]
+.venv/
+
+# uv writes this when something puts it in project mode rather than script
+# mode. The benchmark itself runs from the inline metadata at the top of
+# main.py, so this is not needed to reproduce a run.
+.venv
+
+# Editor and operating system noise.
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
