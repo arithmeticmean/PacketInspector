@@ -12,24 +12,30 @@ struct Config {
   // -b <path> (or a bare positional arg): hostnames to block, one per line.
   std::string blocklist_path = "blocklist.txt";
 
-  // -nfq <n>: NFQUEUE number to bind (0..65535). Must match the iptables
-  // `--queue-num` used to steer packets here.
+  // -nfq <n>: the FIRST NFQUEUE number to bind. Worker i binds queue_num + i,
+  // so the set spans [queue_num, queue_num + jobs - 1] and must match the
+  // iptables `--queue-balance` range exactly. Bind fewer queues than the rule
+  // spans and that share of traffic goes uninspected.
   std::uint16_t queue_num = 0;
 
   // -nfq-size <n>: kernel queue depth in PACKETS (nfq_set_queue_maxlen), not
   // bytes. Deeper = more in-flight packets tolerated before the kernel drops
-  // under load. At ~1.5 KB/pkt, 1e6 packets is already ~1.5 GB of headroom.
+  // under load. PER WORKER, so the machine pays jobs times this.
   std::uint32_t queue_maxlen = 8192;
 
-  // -j <n>: total thread budget. Two are infrastructure -- one runs the NFQUEUE
-  // receive loop, one issues verdicts -- and the rest are reassembly /
-  // SNI-extraction workers. See worker_count().
+  // -j <n>: how many workers, and therefore how many queues and how many
+  // threads. Each worker is self-contained -- its own queue, its own
+  // reassembler -- so there are no infrastructure threads to subtract.
   std::size_t jobs = 4;
 
-  // -rcvbuf <bytes>: netlink socket receive buffer (SO_RCVBUF) IN BYTES -- this
-  // is the byte-sized queue capacity. Absorbs recv() bursts so packets aren't
-  // dropped before we drain them. Set via SO_RCVBUFFORCE, so it bypasses
-  // net.core.rmem_max. Capped at ~2 GB (it's an int in the kernel API).
+  // -rcvbuf <bytes>: netlink socket receive buffer (SO_RCVBUF) IN BYTES.
+  // Absorbs recv() bursts so packets aren't dropped before we drain them. Set
+  // via SO_RCVBUFFORCE, so it bypasses net.core.rmem_max.
+  //
+  // This is the TOTAL across all workers; each gets its share (see
+  // recv_buf_per_worker()). Splitting rather than multiplying is deliberate:
+  // the value that used to be right for one queue would otherwise quietly
+  // become 8x that with -j 8.
   int recv_buf_bytes = 256 * 1024 * 1024; // 256 MiB
 
   // -max-blocked <n>: ceiling on how many *already-blocked* flows a worker
@@ -44,6 +50,25 @@ struct Config {
   // re-parsing a retransmitted ClientHello to reach the same verdict, so it is
   // safe to keep small.
   std::size_t max_blocked_flows = 0;
+
+  // -pin <cpu>: pin worker i to CPU (cpu + i). -1 leaves scheduling alone.
+  //
+  // Worth having for a packet path: an unpinned worker gets migrated between
+  // cores, and every migration costs it the flow table and reassembly state it
+  // had warm in that core's cache. It also makes a benchmark repeatable, since
+  // otherwise the scheduler's choices are part of every measurement.
+  int pin_first_cpu = -1;
+
+  // -pin-stride <n>: worker i goes to CPU (pin_first_cpu + i * n).
+  //
+  // A stride exists because "one worker per CPU number" is usually the wrong
+  // thing. With SMT, adjacent CPU numbers are often two threads of ONE physical
+  // core, so -pin 0 with 4 workers can land two of them on the same core --
+  // which reads as the architecture failing to scale when what actually
+  // happened is that two workers were fighting over one core's execution units.
+  // `lscpu -e=CPU,CORE` shows the mapping; stride 2 is right when siblings are
+  // adjacent pairs, stride 1 when the second half of the CPU list is siblings.
+  int pin_stride = 1;
 
   // -v: log a line per resolved flow. OFF by default -- at load that is a
   // write() per flow from a worker thread through std::cout's lock, which is
@@ -65,12 +90,23 @@ struct Config {
   // looks identical to one that didn't.
   unsigned stats_interval_s = 0;
 
-  // Workers = jobs minus the receive thread and the verdict thread; always at
-  // least one. Reserving only one of the two oversubscribes a pinned CPU set by
-  // a thread, and the one that loses the race is whichever is unlucky --
-  // including the receive loop, whose stalling means the kernel queue overflows
-  // and packets are dropped before we ever see them.
-  std::size_t worker_count() const noexcept {
-    return jobs > 2 ? jobs - 2 : 1;
+  // One worker per job: each owns a queue, a thread and a reassembler, and
+  // nothing is reserved for infrastructure.
+  std::size_t worker_count() const noexcept { return jobs > 0 ? jobs : 1; }
+
+  // The last queue number in the balance range. Handy for printing the exact
+  // `--queue-balance` the iptables rule has to use.
+  std::uint16_t last_queue_num() const noexcept {
+    return static_cast<std::uint16_t>(queue_num + worker_count() - 1);
+  }
+
+  // Each worker's share of the total receive buffer, never below 1 MiB -- a
+  // buffer too small to hold one burst drops packets before we can read them,
+  // which is worse than overshooting the total.
+  int recv_buf_per_worker() const noexcept {
+    const auto share =
+        static_cast<std::size_t>(recv_buf_bytes) / worker_count();
+    constexpr std::size_t kFloor = 1024 * 1024;
+    return static_cast<int>(share < kFloor ? kFloor : share);
   }
 };

@@ -133,18 +133,14 @@ endif()
 set(NFQUEUE_TLS_PORTS "443,8443" CACHE STRING
     "Comma-separated TCP ports to feed to NFQUEUE in the default 'ports' mode.")
 
-# std::thread in PacketQueue's consumer model.
+# One std::thread per worker.
 find_package(Threads REQUIRED)
 
-FetchContent_Declare(
-    moodycamel
-    GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-    GIT_TAG master
-    GIT_SHALLOW TRUE
-)
-
-FetchContent_MakeAvailable(moodycamel)
-
+# NOTE: the unit build deliberately leaves out NFQueue and Worker. Everything
+# they do is netlink and thread lifecycle, which cannot be exercised without
+# root and a live queue -- that is what tests/e2e is for. What IS unit-tested is
+# the logic those two only transport: dissection, blocklist matching, and the
+# extractor.
 
 # Collect all source files (C netlink layer + C++ application)
 file(GLOB_RECURSE PROJECT_SOURCES CONFIGURE_DEPENDS
@@ -152,13 +148,12 @@ file(GLOB_RECURSE PROJECT_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
 )
 
-# Our target: reads packets from NFQUEUE and prints them.
+# Our target: N workers, each inspecting one NFQUEUE.
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
 
 target_include_directories(${PROJECT_NAME}
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        "${MOODYCAMEL_INCLUDE_DIR}"
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -166,7 +161,6 @@ target_link_libraries(${PROJECT_NAME}
         PkgConfig::NFQ
         PcapPlusPlus::Pcap++
         Threads::Threads
-        concurrentqueue
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
@@ -215,22 +209,18 @@ if(PACKET_BUILD_TESTS)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_blocklist.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_packet.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_extractor.cpp"
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_worker.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/packet.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/hostname_extractor.cpp"
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/packet_worker.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/src/blocklist.cpp")
 
   target_include_directories(unit_tests PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit"
-      "${MOODYCAMEL_INCLUDE_DIR}")
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit")
 
   target_link_libraries(unit_tests PRIVATE
       GTest::gtest_main
       PcapPlusPlus::Pcap++
-      Threads::Threads
-      concurrentqueue)
+      Threads::Threads)
 
   target_compile_options(unit_tests PRIVATE -Wall -Wextra)
 
@@ -243,31 +233,51 @@ endif()
 # real inspector in the middle. Separate binaries and a separate driver, so
 # nothing here can be confused with the unit build.
 if(PACKET_BUILD_E2E)
-  # Nothing is compiled here. The client is curl and the server is
-  # `openssl s_server`, both of which do TLS better than anything worth writing
-  # for a test -- and curl's --resolve puts an arbitrary name in SNI while
-  # connecting to a given IP, which is precisely what needs exercising.
-  find_program(CURL_EXECUTABLE NAMES curl REQUIRED)
-  find_program(OPENSSL_EXECUTABLE NAMES openssl REQUIRED)
-  message(STATUS "e2e: curl at ${CURL_EXECUTABLE}, openssl at ${OPENSSL_EXECUTABLE}")
+  # Two binaries plus a driver script.
+  #
+  #   e2e_sender    crafts the whole corpus with PcapPlusPlus and injects it
+  #                 straight onto a veth, so the local TCP stack never touches
+  #                 it and sequence numbers, flags and ordering are exactly what
+  #                 the test says they are.
+  #   e2e_receiver  sniffs the far side of the router and asserts, per packet,
+  #                 that it arrived or did not.
+  #
+  # Both compile e2e_cases.cpp, so the corpus is defined once and the two
+  # cannot drift apart about what was sent or what was expected.
+  add_executable(e2e_sender
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_sender.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_cases.cpp")
+  add_executable(e2e_receiver
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_receiver.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/e2e_cases.cpp")
+
+  foreach(t e2e_sender e2e_receiver)
+    target_include_directories(${t} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e")
+    target_link_libraries(${t} PRIVATE PcapPlusPlus::Pcap++ Threads::Threads)
+    target_compile_options(${t} PRIVATE -Wall -Wextra)
+  endforeach()
 
   set(PACKETINSPECTOR_BIN "$<TARGET_FILE:${PROJECT_NAME}>")
+  set(E2E_SENDER_BIN      "$<TARGET_FILE:e2e_sender>")
+  set(E2E_RECEIVER_BIN    "$<TARGET_FILE:e2e_receiver>")
   set(NFQUEUE_SH          "${CMAKE_CURRENT_BINARY_DIR}/nfqueue.sh")
 
-  # configure_file can't expand generator expressions, so the driver is written
-  # at build time, once the target paths are known.
+  # configure_file cannot expand generator expressions, so the driver is
+  # written at build time, once the target paths are known.
+  configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/run.sh.in"
+      "${CMAKE_CURRENT_BINARY_DIR}/e2e/run.sh.configured"
+      @ONLY)
   file(GENERATE
       OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/e2e/run.sh"
       INPUT "${CMAKE_CURRENT_BINARY_DIR}/e2e/run.sh.configured"
       FILE_PERMISSIONS
           OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
           WORLD_READ WORLD_EXECUTE)
-  configure_file(
-      "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/run.sh.in"
-      "${CMAKE_CURRENT_BINARY_DIR}/e2e/run.sh.configured"
-      @ONLY)
 
-  add_custom_target(e2e ALL DEPENDS ${PROJECT_NAME})
+  add_custom_target(e2e ALL DEPENDS ${PROJECT_NAME} e2e_sender e2e_receiver)
 
   # Registered with CTest but labelled separately, so `ctest -L unit` never
   # trips over it. It fails with a clear message when not run as root.
@@ -276,5 +286,50 @@ if(PACKET_BUILD_E2E)
            COMMAND "${CMAKE_CURRENT_BINARY_DIR}/e2e/run.sh")
   set_tests_properties(e2e_tls_blocking PROPERTIES
       LABELS e2e
-      TIMEOUT 180)
+      TIMEOUT 300)
+endif()
+
+# ---------------------------------------------------------------------------
+# Benchmark: -DPACKET_BUILD_BENCH=ON, then `sudo ./build/bench/run.sh [seconds]`
+#
+# Same namespace model as the e2e suite -- crafted packets, no real TCP or TLS
+# -- but tuned for volume rather than coverage. Off by default and never wired
+# into CTest: it takes minutes and its output is numbers to read, not a verdict
+# to assert.
+option(PACKET_BUILD_BENCH "Build the throughput/latency benchmark (needs root to run)" OFF)
+
+if(PACKET_BUILD_BENCH)
+  add_executable(bench_sender
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/bench_sender.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/bench_common.cpp")
+  add_executable(bench_receiver
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/bench_receiver.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/bench_common.cpp")
+
+  foreach(t bench_sender bench_receiver)
+    target_include_directories(${t} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench")
+    target_link_libraries(${t} PRIVATE PcapPlusPlus::Pcap++ Threads::Threads)
+    # -O2 regardless of build type: a debug-build load generator measures the
+    # load generator.
+    target_compile_options(${t} PRIVATE -Wall -Wextra -O2)
+  endforeach()
+
+  set(PACKETINSPECTOR_BIN "$<TARGET_FILE:${PROJECT_NAME}>")
+  set(BENCH_SENDER_BIN    "$<TARGET_FILE:bench_sender>")
+  set(BENCH_RECEIVER_BIN  "$<TARGET_FILE:bench_receiver>")
+
+  configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/run.sh.in"
+      "${CMAKE_CURRENT_BINARY_DIR}/bench/run.sh.configured"
+      @ONLY)
+  file(GENERATE
+      OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bench/run.sh"
+      INPUT "${CMAKE_CURRENT_BINARY_DIR}/bench/run.sh.configured"
+      FILE_PERMISSIONS
+          OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+          WORLD_READ WORLD_EXECUTE)
+
+  add_custom_target(bench ALL DEPENDS ${PROJECT_NAME} bench_sender bench_receiver)
 endif()

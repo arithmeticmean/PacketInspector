@@ -2,11 +2,16 @@
 # Install / remove the rules that feed packets to NFQUEUE, for both address
 # families. Paths and defaults are substituted by CMake at configure time.
 #
-#   sudo ./nfqueue.sh up      [queue-num]
+#   sudo ./nfqueue.sh up      [queue-num] [workers]
 #   sudo ./nfqueue.sh down    [queue-num]
 #   sudo ./nfqueue.sh status  [queue-num]
 #
 # Environment:
+#   WORKERS=4        how many queues to balance across. MUST equal the
+#                    inspector's -j. The kernel hashes every packet to a queue
+#                    in the range and there is no failover, so a queue with no
+#                    listener loses its whole share of the traffic -- dropped,
+#                    or accepted uninspected because of --queue-bypass.
 #   PORTS=443,8443   TCP destination ports to inspect   (MODE=ports only)
 #   MODE=ports       what to send to the queue:
 #                      ports  -- TCP traffic to PORTS. Inherently
@@ -33,16 +38,37 @@ IP6TABLES="@IP6TABLES_EXECUTABLE@"
 CHAIN="PACKETINSPECTOR"
 
 QUEUE_NUM="${QUEUE_NUM:-0}"
+WORKERS="${WORKERS:-4}"
 PORTS="${PORTS:-@NFQUEUE_TLS_PORTS@}"
 MODE="${MODE:-ports}"
 
 usage() {
-  echo "usage: $0 {up|down|status} [queue-num]" >&2
+  echo "usage: $0 {up|down|status} [queue-num] [workers]" >&2
   exit 1
 }
 
 [[ $# -ge 1 ]] || usage
 [[ $# -ge 2 ]] && QUEUE_NUM="$2"
+[[ $# -ge 3 ]] && WORKERS="$3"
+
+if ! [[ "$WORKERS" =~ ^[0-9]+$ ]] || [[ "$WORKERS" -lt 1 ]]; then
+  echo "WORKERS must be a positive integer, got '$WORKERS'" >&2
+  exit 1
+fi
+QUEUE_LAST=$((QUEUE_NUM + WORKERS - 1))
+if [[ "$QUEUE_LAST" -gt 65535 ]]; then
+  echo "queue range $QUEUE_NUM:$QUEUE_LAST exceeds the 65535 maximum" >&2
+  exit 1
+fi
+
+# One queue needs --queue-num; a range needs --queue-balance. Using the range
+# form for a single queue works too, but the explicit form is clearer in
+# `iptables -S` output, which is where anyone debugging this will look first.
+if [[ "$WORKERS" -eq 1 ]]; then
+  QUEUE_TARGET=(--queue-num "$QUEUE_NUM")
+else
+  QUEUE_TARGET=(--queue-balance "$QUEUE_NUM:$QUEUE_LAST")
+fi
 
 if [[ "$1" != "status" && $EUID -ne 0 ]]; then
   echo "must run as root (CAP_NET_ADMIN)" >&2
@@ -77,11 +103,11 @@ up_one() {
   "$bin" -N "$CHAIN" 2>/dev/null || true # already exists: fine
   "$bin" -F "$CHAIN"                     # refill from scratch
   "$bin" -A "$CHAIN" "${MATCH[@]}" -j NFQUEUE \
-      --queue-num "$QUEUE_NUM" --queue-bypass
+      "${QUEUE_TARGET[@]}" --queue-bypass
   if ! "$bin" -C FORWARD -j "$CHAIN" 2>/dev/null; then
     "$bin" -I FORWARD -j "$CHAIN"
   fi
-  echo "IPv$ver: FORWARD -> $CHAIN -> NFQUEUE $QUEUE_NUM (MODE=$MODE)"
+  echo "IPv$ver: FORWARD -> $CHAIN -> NFQUEUE $QUEUE_NUM:$QUEUE_LAST (MODE=$MODE)"
 }
 
 down_one() {
@@ -109,6 +135,8 @@ status_one() {
 case "$1" in
   up)
     warn_no_ipv6
+    echo "balancing across $WORKERS queue(s): $QUEUE_NUM..$QUEUE_LAST"
+    echo "start the inspector with: -j $WORKERS -nfq $QUEUE_NUM"
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
     while read -r ver bin; do up_one "$ver" "$bin"; done < <(families)

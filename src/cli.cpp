@@ -15,26 +15,38 @@ constexpr const char *kProg = "PacketInspector";
 
 void usage(std::ostream &os) {
   os << "usage: " << kProg << " [options] [blocklist]\n\n"
-     << "Attach to an NFQUEUE and DROP flows whose TLS SNI is on the blocklist;\n"
+     << "Attach to an NFQUEUE and DROP flows whose TLS SNI is on the "
+        "blocklist;\n"
      << "everything else is ACCEPTed.\n\n"
      << "options:\n"
-     << "  -j <n>          thread budget: one runs the receive loop, the rest\n"
-     << "                  are reassembly workers                 (default 4)\n"
-     << "  -nfq <n>        NFQUEUE number to bind (0..65535)      (default 0)\n"
-     << "  -nfq-size <n>   NFQUEUE depth in packets                (default 8192)\n"
-     << "  -rcvbuf <n>     netlink socket recv buffer, bytes     (default 256MiB)\n"
+     << "  -j <n>          workers to run. Each owns one NFQUEUE, one thread\n"
+     << "                  and one reassembler                    (default 4)\n"
+     << "  -nfq <n>        FIRST NFQUEUE number; worker i binds <n>+i, so the\n"
+     << "                  set must match iptables --queue-balance (default "
+        "0)\n"
+     << "  -nfq-size <n>   NFQUEUE depth in packets, per worker    (default "
+        "8192)\n"
+     << "  -rcvbuf <n>     netlink recv buffer in bytes, TOTAL across workers\n"
+     << "                                                     (default "
+        "256MiB)\n"
      << "  -max-blocked <n>  blocked flows a worker remembers, so they cannot\n"
      << "                  crowd out flows still awaiting a verdict\n"
-     << "                                            (default: a quarter of the\n"
+     << "                                            (default: a quarter of "
+        "the\n"
      << "                                             flow cap, i.e. 16384)\n"
      << "  -b <path>       blocklist file (or pass it positionally)\n"
-     << "                                                 (default blocklist.txt)\n"
-     << "  -v, --verbose   log a line per resolved flow; off by default because\n"
+     << "                                                 (default "
+        "blocklist.txt)\n"
+     << "  -pin <cpu>      pin worker i to CPU <cpu> + i*stride; off by default\n"
+     << "  -pin-stride <n> CPU stride between workers, for SMT   (default 1)\n"
+     << "  -v, --verbose   log a line per resolved flow; off by default "
+        "because\n"
      << "                  at load it costs a write() per flow\n"
      << "  --passthrough   allow every packet without inspecting; benchmark\n"
      << "                  baseline for the NFQUEUE round trip alone\n"
      << "  --stats <n>     print a counters line to stderr every n seconds\n"
-     << "                                                        (default off)\n"
+     << "                                                        (default "
+        "off)\n"
      << "  -h, --help      show this help and exit\n";
 }
 
@@ -120,6 +132,22 @@ ParseResult parse(int argc, char **argv) {
         return r;
       }
       cfg.max_blocked_flows = static_cast<std::size_t>(n);
+    } else if (arg == "-pin") {
+      if (!value(i, arg, val))
+        return r;
+      if (!parse_uint(val, 0, 4095, n)) {
+        fail("-pin expects a CPU number 0..4095, got '" + val + "'");
+        return r;
+      }
+      cfg.pin_first_cpu = static_cast<int>(n);
+    } else if (arg == "-pin-stride") {
+      if (!value(i, arg, val))
+        return r;
+      if (!parse_uint(val, 1, 64, n)) {
+        fail("-pin-stride expects 1..64, got '" + val + "'");
+        return r;
+      }
+      cfg.pin_stride = static_cast<int>(n);
     } else if (arg == "-rcvbuf") {
       if (!value(i, arg, val))
         return r;
@@ -150,6 +178,17 @@ ParseResult parse(int argc, char **argv) {
     } else {
       cfg.blocklist_path = std::string(arg); // bare positional = blocklist
     }
+  }
+
+  // Worker i binds queue_num + i, so the whole range has to stay inside the
+  // 16-bit queue number space. Catch it here rather than as a bind failure on
+  // worker 40000.
+  if (cfg.queue_num + cfg.worker_count() - 1 > 65535) {
+    fail("-nfq " + std::to_string(cfg.queue_num) + " with -j " +
+         std::to_string(cfg.jobs) + " would need queues up to " +
+         std::to_string(cfg.queue_num + cfg.worker_count() - 1) +
+         ", past the 65535 maximum");
+    return r;
   }
   return r;
 }

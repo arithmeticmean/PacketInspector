@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# Throughput and latency benchmark, over the same namespace topology the e2e
+# suite uses -- crafted packets, no real TCP or TLS.
+#
+#   sudo ./bench/run.sh [seconds-per-run]
+#
+# WHAT IS MEASURED, AND FROM WHERE
+#
+#   offered    the sender's own count. What we asked the system to carry.
+#   delivered  the ROUTER's TX counter on the server-side interface. Kernel
+#              counters, so they cannot drop the way a userspace capture can.
+#              This is the number that says how much actually got through.
+#   qdrop      the kernel's own NFQUEUE drop counters, per queue. Non-zero
+#              means the inspector fell behind and the kernel discarded rather
+#              than queue -- the real saturation signal.
+#   latency    sampled by the receiver from a timestamp carried in each packet.
+#              Sampling is fine for percentiles; it would not be fine for
+#              counting, which is why counting is not done there.
+#   spread     per-queue cumulative packet count, from column 8 (id_sequence)
+#              of /proc/net/netfilter/nfnetlink_queue -- NOT column 3, which is
+#              the instantaneous queue length and reads as zero once a run ends.
+#              This is the number that says whether adding workers can help.
+#
+# THE FOUR PROFILES, and why a single number would be meaningless without them:
+#
+#   wire         no iptables rule. Pure veth + forwarding. The floor.
+#   passthrough  NFQUEUE round trip, verdict ALLOW, no inspection at all.
+#                (passthrough - wire) is what the queue itself costs.
+#   bulk         payload packets on flows that are never tracked -- one dissect,
+#                one failed lookup, one verdict. The path nearly all real
+#                traffic takes. (bulk - passthrough) is what inspection costs.
+#   tls          every flow opens with a full ClientHello, so every flow is
+#                tracked, reassembled and resolved. The worst case.
+#
+# Requires root: namespaces, veth pairs, iptables rules.
+set -euo pipefail
+
+INSPECTOR="@PACKETINSPECTOR_BIN@"
+SENDER="@BENCH_SENDER_BIN@"
+RECEIVER="@BENCH_RECEIVER_BIN@"
+
+SECONDS_PER_RUN="${1:-4}"
+WORKER_COUNTS=(1 2 4)
+PROFILES=(wire passthrough bulk tls)
+# Offered rates, in packets/sec. A sweep rather than a single number: at one
+# rate you cannot tell "kept up easily" from "only just kept up", and unpaced
+# sending measures how deep the buffers are rather than what the system carries.
+RATES=(100000 300000 600000)
+# The tls profile is a NEW-FLOW rate, not a packet rate: every packet opens a
+# connection. Real traffic does not open 75k connections/sec, and the sender's
+# ring would wrap and start replaying flows (see kRing in bench_sender.cpp), so
+# it gets its own, realistic ladder.
+TLS_RATES=(5000 20000 50000)
+
+# One sender process tops out near 120k pps -- a syscall per packet through
+# libpcap -- which is not enough to saturate even two workers. Run several in
+# parallel, each on its own CPU, each generating a disjoint slice of the flow
+# space (--shard).
+SENDERS="${SENDERS:-4}"
+
+# CPU assignment, derived from the machine rather than assumed.
+#
+# Two rules decide everything here:
+#   * No two WORKERS may share a physical core. If they do, adding workers adds
+#     no execution resources and the scaling result is meaningless.
+#   * Senders may not share a core with a worker, or the benchmark measures the
+#     two competing instead of the inspector working.
+#
+# So: one CPU from each physical core, in order. The first half of that list
+# goes to workers (one per core); the rest, plus the leftover SMT siblings, go
+# to the senders, which are syscall-bound and tolerate sharing a core well.
+readarray -t CORE_FIRST_CPU < <(
+  lscpu -e=CPU,CORE 2>/dev/null | awk 'NR>1 && !seen[$2]++ {print $1}'
+)
+if [[ "${#CORE_FIRST_CPU[@]}" -lt 2 ]]; then
+  CORE_FIRST_CPU=(0 1 2 3)   # no topology info: fall back to plain numbering
+fi
+NCORES="${#CORE_FIRST_CPU[@]}"
+
+# Stride between consecutive workers, so worker i lands on its own core.
+INSPECTOR_CPU_BASE="${INSPECTOR_CPU_BASE:-${CORE_FIRST_CPU[0]}}"
+if [[ "$NCORES" -ge 2 ]]; then
+  PIN_STRIDE="${PIN_STRIDE:-$(( CORE_FIRST_CPU[1] - CORE_FIRST_CPU[0] ))}"
+else
+  PIN_STRIDE="${PIN_STRIDE:-1}"
+fi
+
+# Senders get the cores the workers are not using, from the top down.
+MAX_WORKERS=0
+for w in "${WORKER_COUNTS[@]}"; do (( w > MAX_WORKERS )) && MAX_WORKERS=$w; done
+_sender_cpus=()
+for (( c = NCORES - 1; c >= MAX_WORKERS && ${#_sender_cpus[@]} < 8; c-- )); do
+  _sender_cpus+=("${CORE_FIRST_CPU[$c]}")
+  _sender_cpus+=("$(( CORE_FIRST_CPU[c] + 1 ))")  # its SMT sibling
+done
+[[ "${#_sender_cpus[@]}" -eq 0 ]] && _sender_cpus=(0)
+if [[ -n "${SENDER_CPUS:-}" ]]; then
+  read -ra SENDER_CPUS <<<"$SENDER_CPUS"
+else
+  SENDER_CPUS=("${_sender_cpus[@]}")
+fi
+RECEIVER_CPU="${RECEIVER_CPU:-${SENDER_CPUS[${#SENDER_CPUS[@]}-1]}}"
+
+CLI_NS=pi-bench-cli
+RTR_NS=pi-bench-rtr
+SRV_NS=pi-bench-srv
+CLI_IF=vbcli
+RTR_CLI_IF=vbrtrc
+SRV_IF=vbsrv
+RTR_SRV_IF=vbrtrs
+
+CLI_IP4=10.98.1.2
+RTR_CLI_IP4=10.98.1.1
+RTR_SRV_IP4=10.98.2.1
+SRV_IP4=10.98.2.2
+
+BLOCKLIST=""
+RESULTS=""
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+info()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+[[ $EUID -eq 0 ]] || { red "must run as root"; exit 1; }
+for b in "$INSPECTOR" "$SENDER" "$RECEIVER"; do
+  [[ -x "$b" ]] || { red "not built: $b"; exit 1; }
+done
+
+teardown_ns() {
+  set +e
+  ip netns del "$CLI_NS" 2>/dev/null
+  ip netns del "$RTR_NS" 2>/dev/null
+  ip netns del "$SRV_NS" 2>/dev/null
+  set -e
+}
+cleanup() { teardown_ns; [[ -n "$BLOCKLIST" ]] && rm -f "$BLOCKLIST"; }
+trap cleanup EXIT
+
+setup_topology() {
+  teardown_ns
+  ip netns add "$CLI_NS"; ip netns add "$RTR_NS"; ip netns add "$SRV_NS"
+  ip link add "$CLI_IF" type veth peer name "$RTR_CLI_IF"
+  ip link add "$SRV_IF" type veth peer name "$RTR_SRV_IF"
+  ip link set "$CLI_IF" netns "$CLI_NS"; ip link set "$RTR_CLI_IF" netns "$RTR_NS"
+  ip link set "$SRV_IF" netns "$SRV_NS"; ip link set "$RTR_SRV_IF" netns "$RTR_NS"
+
+  ip -n "$CLI_NS" addr add "$CLI_IP4/24" dev "$CLI_IF"
+  ip -n "$CLI_NS" link set "$CLI_IF" up; ip -n "$CLI_NS" link set lo up
+  ip -n "$CLI_NS" route add default via "$RTR_CLI_IP4"
+
+  ip -n "$RTR_NS" addr add "$RTR_CLI_IP4/24" dev "$RTR_CLI_IF"
+  ip -n "$RTR_NS" addr add "$RTR_SRV_IP4/24" dev "$RTR_SRV_IF"
+  ip -n "$RTR_NS" link set "$RTR_CLI_IF" up; ip -n "$RTR_NS" link set "$RTR_SRV_IF" up
+  ip -n "$RTR_NS" link set lo up
+
+  ip -n "$SRV_NS" addr add "$SRV_IP4/24" dev "$SRV_IF"
+  ip -n "$SRV_NS" link set "$SRV_IF" up; ip -n "$SRV_NS" link set lo up
+  ip -n "$SRV_NS" route add default via "$RTR_SRV_IP4"
+
+  ip netns exec "$RTR_NS" sysctl -qw net.ipv4.ip_forward=1
+  ip netns exec "$RTR_NS" sysctl -qw net.ipv4.conf.all.rp_filter=0
+  # Queue lengths on the veths themselves, so the test is not measuring the
+  # default 1000-packet txqueue overflowing before the inspector is even reached.
+  ip -n "$RTR_NS" link set "$RTR_CLI_IF" txqueuelen 10000
+  ip -n "$RTR_NS" link set "$RTR_SRV_IF" txqueuelen 10000
+  ip -n "$CLI_NS" link set "$CLI_IF" txqueuelen 10000
+
+  ip netns exec "$RTR_NS" ping -c1 -W2 "$SRV_IP4" >/dev/null 2>&1 || true
+  ip netns exec "$CLI_NS" ping -c1 -W2 "$SRV_IP4" >/dev/null 2>&1 \
+    || { red "path is not forwarding"; exit 1; }
+}
+
+# TX packets on the router's server-side interface: what actually got forwarded.
+rtr_tx() {
+  ip -n "$RTR_NS" -s -j link show dev "$RTR_SRV_IF" 2>/dev/null \
+    | grep -o '"tx"[^}]*"packets":[0-9]*' | grep -o '[0-9]*$' \
+    || ip -n "$RTR_NS" -s link show dev "$RTR_SRV_IF" \
+       | awk '/TX:/{getline; print $2}'
+}
+
+# Per-queue "queued" and "dropped" totals, as "q0:total:drop q1:..."
+queue_stats() {
+  ip netns exec "$RTR_NS" cat /proc/net/netfilter/nfnetlink_queue 2>/dev/null \
+    | awk '{printf "q%s:%s:%s ", $1, $8, $6}'
+}
+
+run_one() {
+  local profile="$1" workers="$2" pps="$3"
+  setup_topology
+
+  local qlast=$((workers - 1))
+  local target
+  if [[ "$workers" -eq 1 ]]; then
+    target=(--queue-num 0)
+  else
+    target=(--queue-balance "0:$qlast")
+  fi
+
+  local insp_pid="" insp_log
+  insp_log="$(mktemp /tmp/pi-bench-insp.XXXXXX)"
+
+  if [[ "$profile" != "wire" ]]; then
+    ip netns exec "$RTR_NS" iptables -A FORWARD -p tcp --dport 443 \
+        -j NFQUEUE "${target[@]}" --queue-bypass
+
+    local extra=()
+    [[ "$profile" == "passthrough" ]] && extra=(--passthrough)
+    ip netns exec "$RTR_NS" "$INSPECTOR" -j "$workers" -nfq 0 \
+        -pin "$INSPECTOR_CPU_BASE" -pin-stride "$PIN_STRIDE" \
+        -b "$BLOCKLIST" "${extra[@]}" >"$insp_log" 2>&1 &
+    insp_pid=$!
+
+    local waited=0
+    until grep -q "iptables must route" "$insp_log" 2>/dev/null; do
+      sleep 0.1; waited=$((waited + 1))
+      [[ $waited -gt 100 ]] && { red "inspector did not start"; cat "$insp_log"; exit 1; }
+    done
+    sleep 0.3
+  fi
+
+  local gw_mac
+  gw_mac="$(ip -n "$RTR_NS" -br link show dev "$RTR_CLI_IF" | awk '{print $3}')"
+
+  local rcv_out
+  rcv_out="$(mktemp /tmp/pi-bench-rcv.XXXXXX)"
+  ip netns exec "$SRV_NS" taskset -c "$RECEIVER_CPU" "$RECEIVER" \
+      --iface "$SRV_IF" \
+      --seconds $((SECONDS_PER_RUN + 2)) >"$rcv_out" 2>/dev/null &
+  local rcv_pid=$!
+  sleep 0.6
+
+  local tx_before tx_after
+  tx_before="$(rtr_tx)"
+
+  # Fan the offered rate out across SENDERS processes, each pinned and each on
+  # its own shard of the flow space.
+  local prof_arg
+  prof_arg="$( [[ "$profile" == "tls" ]] && echo tls || echo bulk )"
+  local per_sender=$(( pps / SENDERS ))
+  local send_dir
+  send_dir="$(mktemp -d /tmp/pi-bench-send.XXXXXX)"
+
+  # Collect the sender PIDs and wait on exactly those.
+  #
+  # NOT `wait` with no arguments, and not `wait $(jobs -rp)`: both of those also
+  # wait for the INSPECTOR, which runs until it is killed at the end of the run
+  # and so never returns. That hangs the whole benchmark with every CPU idle.
+  local si
+  local sender_pids=()
+  for (( si = 0; si < SENDERS; si++ )); do
+    local cpu="${SENDER_CPUS[$(( si % ${#SENDER_CPUS[@]} ))]}"
+    ip netns exec "$CLI_NS" taskset -c "$cpu" "$SENDER" \
+        --iface "$CLI_IF" --dst-mac "$gw_mac" \
+        --seconds "$SECONDS_PER_RUN" --pps "$per_sender" \
+        --shard "$si" --shards "$SENDERS" --profile "$prof_arg" \
+        >"$send_dir/$si" 2>/dev/null &
+    sender_pids+=("$!")
+  done
+  for si in "${sender_pids[@]}"; do
+    wait "$si" 2>/dev/null || true
+  done
+
+  local send_out
+  send_out="$(cat "$send_dir"/* 2>/dev/null)"
+  rm -rf "$send_dir"
+
+  sleep 0.5
+  tx_after="$(rtr_tx)"
+  local qs=""
+  [[ "$profile" != "wire" ]] && qs="$(queue_stats)"
+
+  wait "$rcv_pid" 2>/dev/null || true
+  [[ -n "$insp_pid" ]] && { kill "$insp_pid" 2>/dev/null || true; wait "$insp_pid" 2>/dev/null || true; }
+
+  # Sum across shards; take the longest elapsed, since they ran concurrently.
+  local offered elapsed
+  offered="$(awk '{for(i=1;i<=NF;i++) if($i=="SENT") s+=$(i+1)} END{print s+0}' <<<"$send_out")"
+  elapsed="$(awk '{for(i=1;i<=NF;i++) if($i=="ELAPSED" && $(i+1)>m) m=$(i+1)} END{print (m>0)?m:1}' <<<"$send_out")"
+  local delivered=$((tx_after - tx_before))
+
+  local p50 p99 samples capdrop
+  p50="$(sed -n 's/.*P50 \([0-9]*\).*/\1/p' "$rcv_out")"
+  p99="$(sed -n 's/.*P99 \([0-9]*\).*/\1/p' "$rcv_out")"
+  samples="$(sed -n 's/.*SAMPLES \([0-9]*\).*/\1/p' "$rcv_out")"
+  capdrop="$(sed -n 's/.*CAPDROP \([0-9]*\).*/\1/p' "$rcv_out")"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$profile" "$workers" "${offered:-0}" "$delivered" "${elapsed:-1}" \
+    "${p50:-0}" "${p99:-0}" "${samples:-0}" "${capdrop:-0}" "$pps" "${qs:-}" \
+    >>"$RESULTS"
+
+  rm -f "$insp_log" "$rcv_out"
+}
+
+# --- go --------------------------------------------------------------------
+
+BLOCKLIST="$(mktemp /tmp/pi-bench-bl.XXXXXX)"
+printf 'blocked.bench.test\n' >"$BLOCKLIST"
+RESULTS="$(mktemp /tmp/pi-bench-results.XXXXXX)"
+
+info "each run offers load for ${SECONDS_PER_RUN}s"
+info "$NCORES physical cores; workers pinned from CPU $INSPECTOR_CPU_BASE stride $PIN_STRIDE"
+info "$SENDERS sender(s) on CPUs ${SENDER_CPUS[*]}, receiver on CPU $RECEIVER_CPU"
+
+for profile in "${PROFILES[@]}"; do
+  for w in "${WORKER_COUNTS[@]}"; do
+    # 'wire' has no inspector, so worker count is meaningless -- run it once.
+    [[ "$profile" == "wire" && "$w" -ne 1 ]] && continue
+    local_rates=("${RATES[@]}")
+    [[ "$profile" == "tls" ]] && local_rates=("${TLS_RATES[@]}")
+    for rate in "${local_rates[@]}"; do
+      info "profile=$profile workers=$w offered=${rate}pps"
+      run_one "$profile" "$w" "$rate"
+    done
+  done
+done
+
+# --- report ----------------------------------------------------------------
+
+echo
+printf '%-12s %8s %10s %12s %12s %8s %8s %8s\n' \
+  PROFILE WORKERS TARGET OFFERED_PPS DELIVERED_PPS LOSS% P50_us P99_us
+printf '%s\n' "---------------------------------------------------------------------------------------"
+
+awk -F'\t' '{
+  off=$3; del=$4; el=$5; p50=$6; p99=$7; tgt=$10;
+  opps = (el>0) ? off/el : 0;
+  dpps = (el>0) ? del/el : 0;
+  loss = (off>0) ? (off-del)*100.0/off : 0;
+  if (loss < 0) loss = 0;
+  printf "%-12s %8s %10s %12.0f %12.0f %7.2f%% %8s %8s\n", $1, $2, tgt, opps, dpps, loss, p50, p99;
+}' "$RESULTS"
+
+echo
+echo "per-queue packet counts (id_sequence) and drops, at the highest offered rate:"
+awk -F'\t' -v last="${RATES[${#RATES[@]}-1]}" -v tlast="${TLS_RATES[${#TLS_RATES[@]}-1]}" \
+  '$11 != "" && ($10 == last || $10 == tlast) { printf "  %-12s w=%s @%s  %s\n", $1, $2, $10, $11 }' "$RESULTS"
+
+echo
+echo "NOTE: if loss is ~0 the inspector kept up with the offered load, so these"
+echo "      are LOWER BOUNDS on capacity, not measured ceilings. Raise the load"
+echo "      (more senders, larger --seconds) until loss appears to find the top."
+
+cp "$RESULTS" /tmp/pi-bench-last.tsv 2>/dev/null || true
+echo "raw rows: /tmp/pi-bench-last.tsv"
+rm -f "$RESULTS"

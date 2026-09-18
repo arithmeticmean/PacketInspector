@@ -1,7 +1,6 @@
 #pragma once
 
 #include "packet.hpp"
-#include "verdict_sink.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -14,8 +13,19 @@
 
 #include <pcapplusplus/TcpReassembly.h>
 
+// A packet the extractor is finished with, and what should happen to it.
+//
+// The extractor never talks to the queue. It appends to a buffer, and the
+// worker that owns both drains it and issues the verdicts. That keeps the two
+// halves independent without an interface between them -- and makes the
+// extractor testable by reading a vector, with nothing to stub out.
+struct Decided {
+  Packet pkt;
+  Verdict verdict = Verdict::ALLOW;
+};
+
 // Abstract interface: consumes a stream of L3 packets (all belonging to one
-// worker's flows) and verdicts every one of them, holding back only those it
+// worker's flows) and decides every one of them, holding back only those it
 // needs to inspect until the flow's hostname is known.
 //
 // Concrete extractors pick their own protocol but share this shape:
@@ -33,10 +43,10 @@ public:
 
   virtual ~HostnameExtractor();
 
-  // Feed one L3 packet. Taken by value: the extractor moves it into its
-  // per-flow state until the flow is decided, so pass an owning Packet (see
-  // Packet::materialize()). Every packet is either verdicted before this
-  // returns or held and verdicted when its flow resolves.
+  // Feed one L3 packet. Taken by value: the extractor may move it into
+  // per-flow state until the flow is decided. Every packet either lands in
+  // decided() before this returns, or is held and lands there when its flow
+  // resolves.
   virtual void feed(Packet pkt) = 0;
 
   // Expire idle flows. Must be called periodically even when no packets arrive,
@@ -44,8 +54,16 @@ public:
   virtual void tick(std::chrono::steady_clock::time_point now) = 0;
 
   // Resolve every tracked flow now, allowing whatever is still held. For
-  // shutdown: anything left unverdicted hangs its connection.
+  // shutdown: anything left undecided hangs its connection.
   virtual void flush() = 0;
+
+  // Everything decided since the last clear, in the order it was decided. The
+  // caller verdicts these and then clears the buffer; it is reused, so a steady
+  // worker stops allocating for it entirely.
+  std::vector<Decided> &decided() noexcept { return _decided; }
+
+protected:
+  std::vector<Decided> _decided;
 };
 
 // TLS-over-TCP hostname extractor.
@@ -63,8 +81,8 @@ public:
 //               payload are held until the hostname is known.
 //   Block       Decided against. Packets are dropped without reassembly.
 //
-// NOT thread-safe: one thread drives one instance, and the Decide/VerdictSink
-// callbacks run inline on that thread and must not re-enter feed().
+// NOT thread-safe: one thread drives one instance, and the Decide callback runs
+// inline on that thread and must not re-enter feed().
 class TcpTlsHostnameExtractor : public HostnameExtractor {
 public:
   // Ceiling on concurrently tracked flows. Without it, connections that each
@@ -83,12 +101,11 @@ public:
   // sending it traffic to block. Bounding them separately is what stops that.
   static constexpr std::size_t kDefaultBlockedShare = 4;
 
-  // `sink` must outlive the extractor. `max_blocked` of 0 derives the blocked
-  // ceiling from max_flows, which is what keeps the two in step when only one
-  // is configured.
-  TcpTlsHostnameExtractor(Decide decide, VerdictSink &sink,
-                          std::size_t max_flows = kDefaultMaxFlows,
-                          std::size_t max_blocked = 0);
+  // `max_blocked` of 0 derives the blocked ceiling from max_flows, which is
+  // what keeps the two in step when only one is configured.
+  explicit TcpTlsHostnameExtractor(Decide decide,
+                                   std::size_t max_flows = kDefaultMaxFlows,
+                                   std::size_t max_blocked = 0);
 
   void feed(Packet pkt) override;
   void tick(std::chrono::steady_clock::time_point now) override;
@@ -129,6 +146,19 @@ private:
   };
 
   // pcpp callbacks -- C function pointers, cookie == this.
+
+  // Fires the moment pcpp creates state for a connection, which is the only
+  // point at which we are guaranteed to learn its key.
+  //
+  // Without this we learned the key from onMessageReady, which only fires when
+  // client->server PAYLOAD arrives. A flow tracked from its SYN that never
+  // sends payload -- a half-open connection, a scan, a client that gives up --
+  // therefore had no key, so resolve() could not close it, and
+  // purgeClosedConnections() only reclaims connections that were explicitly
+  // closed. pcpp's connection map grew without bound for the life of the
+  // process.
+  static void onConnectionStart(const pcpp::ConnectionData &conn, void *cookie);
+
   static void onMessageReady(int8_t side, const pcpp::TcpStreamData &data,
                              void *cookie);
   static void onConnectionEnd(const pcpp::ConnectionData &conn,
@@ -139,7 +169,11 @@ private:
   // entry (ALLOW) or turn it into a Block entry.
   void resolve(uint32_t key, std::optional<std::string> hostname);
   void sweep(std::chrono::steady_clock::time_point now);
-  void sink_one(Packet &&pkt, Verdict v);
+
+  // Park one finished packet in the decided buffer.
+  void decide(Packet &&pkt, Verdict v) {
+    _decided.push_back({std::move(pkt), v});
+  }
 
   // Record `key` as blocked, evicting the oldest blocked flow if the ring is
   // full. One eviction per registration, always: there is no threshold to
@@ -159,9 +193,14 @@ private:
   }
 
   Decide _decide;
-  VerdictSink &_sink;
   pcpp::TcpReassembly _reassembly;
   std::vector<uint32_t> _to_close;
+
+  // Scratch for joining the payloads of a ClientHello that was fragmented
+  // across TLS records. One buffer for the whole extractor, not one per flow:
+  // it is filled and consumed inside a single call, and the extractor is
+  // single-threaded. Reused, so the fragmented path stops allocating.
+  std::vector<uint8_t> _hs_scratch;
   std::unordered_map<uint32_t, Conn> _conns;
 
   // Which flow's packet is currently inside reassemblePacket(). Every pcpp

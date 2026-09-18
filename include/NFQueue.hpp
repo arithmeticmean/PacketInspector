@@ -1,157 +1,160 @@
-// C++ wrapper around libnetfilter_queue, running the queue on two threads:
+// C++ wrapper around libnetfilter_queue for ONE queue number, driven by its
+// caller's thread. It owns no thread and starts nothing; the worker that owns
+// this object calls run_once() in a loop:
 //
-//   receive thread  recv() -> nfq_handle_packet() -> your Callback
-//   verdict thread  drains a lock-free queue -> nfq_set_verdict()
+//   poll()  ->  recv()  ->  nfq_handle_packet()  ->  your Callback, once per
+//                                                    packet in the buffer
 //
-// Splitting them takes the verdict syscall off the receive path entirely. The
-// callback hands each packet on and returns immediately; nothing on the hot
-// path blocks on a syscall or a mutex, so the kernel queue keeps draining even
-// while verdicts are going out. It also means exactly one thread ever writes
-// verdicts, which is why there is no lock here at all: producers only push onto
-// a lock-free queue.
+// Because receive, inspection and verdict all happen on that one thread, a
+// packet never crosses a thread boundary and never has to be copied out of the
+// receive buffer.
 //
-// Packets are moved, never copied. The callback takes ownership of each packet
-// and must eventually route it to submit() -- directly, or via a worker that
-// does. A packet that is never submitted holds a slot in the kernel queue
-// forever and hangs its connection, so an unsubmitted packet coming back from
-// the callback is allowed as a fail-safe (see packets_undecided()).
+// Scale by running N of these, one per thread, each on its own queue number,
+// with iptables spreading traffic across the range:
 //
-// Non-copyable and non-movable: the constructor hands `this` to the C library as
-// the callback's opaque pointer, so the address must stay fixed.
+//   -j NFQUEUE --queue-balance 0:N-1 --queue-bypass
+//
+// The kernel picks the queue by hashing (saddr, daddr, protocol). Ports are NOT
+// in that hash and it is deliberately symmetric, so every flow between a pair
+// of hosts, both directions, lands on the same queue -- which is what lets each
+// worker keep its own reassembler with no locking. The flip side is that load
+// spreads per host-pair, not per flow, so one busy pair sits on one queue.
+//
+// EVERY queue in the range must have a listener. There is no failover: packets
+// hashed to an unbound queue are dropped (or ACCEPTed uninspected, with
+// --queue-bypass). Binding fewer queues than the rule spans silently lets that
+// fraction of traffic through, so a failed bind has to be fatal.
+//
+// Non-copyable and non-movable: the constructor hands `this` to the C library
+// as its opaque user pointer, so the address has to stay put.
 
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
-#include <thread>
 #include <vector>
 
-#include <blockingconcurrentqueue.h>
-
 #include "packet.hpp"
-#include "verdict_sink.hpp"
 
 struct nfq_handle;
 struct nfq_q_handle;
 struct nfgenmsg;
 struct nfq_data;
 
-class NFQueue : public VerdictSink {
+class NFQueue {
 public:
-  // Runs on the receive thread, once per packet, and takes ownership of it.
-  // Keep it quick: the receive loop resumes only when it returns.
+  // Called once per packet, on the caller's thread, and takes ownership of it.
+  //
+  // It does NOT have to verdict the packet before returning -- moving it into
+  // per-flow state to await a hostname is the normal path. It just must not
+  // silently drop it; see packets_undecided().
   using Callback = std::function<void(Packet &&)>;
 
-  // Open + bind queue `queueNum` and register `cb`. `queueMaxLen` sets the
-  // kernel queue depth (nfq_set_queue_maxlen) and `recvBufBytes` the netlink
-  // socket receive buffer -- both best-effort headroom for bursts. Throws
-  // std::system_error (carrying errno) on any initialization failure. No thread
-  // runs until start().
-  NFQueue(std::uint16_t queueNum, Callback cb, std::uint32_t queueMaxLen = 8192,
-          int recvBufBytes = 8 * 1024 * 1024);
-  ~NFQueue() override;
+  // Why run_once() came back.
+  enum class Event : std::uint8_t {
+    Packets, // a buffer was drained; the callback ran once per packet in it
+    Idle,    // poll timed out -- nothing arrived, so run your idle sweep now
+    Stop,    // the stop fd is readable
+    Error,   // the receive path failed; see error()
+  };
+
+  // Open and bind queue `queueNum`.
+  //
+  // `stopFd` is polled alongside the netlink socket but never read or closed
+  // here -- it belongs to the caller and is shared by every worker. Nothing
+  // reads it, so one write leaves it readable for good and wakes all of them.
+  //
+  // `queueMaxLen` (in packets) and `recvBufBytes` (in bytes) are PER QUEUE, so
+  // N workers cost N times these. Worth re-checking a value that was tuned back
+  // when there was only one queue.
+  //
+  // Throws std::system_error (carrying errno) if anything fails to open or bind.
+  NFQueue(std::uint16_t queueNum, Callback cb, int stopFd,
+          std::uint32_t queueMaxLen = 8192, int recvBufBytes = 32 * 1024 * 1024);
+  ~NFQueue();
 
   NFQueue(const NFQueue &) = delete;
   NFQueue &operator=(const NFQueue &) = delete;
   NFQueue(NFQueue &&) = delete;
   NFQueue &operator=(NFQueue &&) = delete;
 
-  // --- lifecycle -----------------------------------------------------------
+  // One turn of the loop: wait up to `timeout`, and if the socket has data,
+  // drain the whole buffer -- one recv() usually carries many packets, and the
+  // callback runs for each.
   //
-  // Shutdown is two-step because the queue cannot know when *your* producers
-  // are done. Stop them in the middle:
-  //
-  //   q.start();
-  //   q.wait();                              // until stop_receiving() or error
-  //   for (auto &w : workers) w->stop();     // workers submit their last verdicts
-  //   q.stop();                              // flush the verdict queue, join
-  //
-  // Skipping the middle step is safe but loses whatever verdicts the workers
-  // had not submitted yet; those packets are left to the kernel queue.
+  // `timeout` must be finite. Blocking forever would mean a quiet worker never
+  // runs its idle sweep, and never releases the packets it is holding for a
+  // flow that has gone silent.
+  Event run_once(std::chrono::milliseconds timeout);
 
-  // Spawn the receive and verdict threads. Idempotent.
-  void start();
+  // Stamp the verdict on `pkt`, release its bytes, and tell the kernel. One
+  // syscall per packet for now; batching several into one nfq_set_verdict_batch
+  // is possible later without changing this signature.
+  void submit(Packet &&pkt, Verdict v);
 
-  // Block until the receive loop stops -- either because stop_receiving() was
-  // called or because it hit an unrecoverable error (see failed()).
-  void wait();
+  // --- counters ------------------------------------------------------------
+  // Atomic because a stats thread may read them while this one runs. Only this
+  // thread writes.
 
-  // Wake the receive loop and join it. No further packets reach the callback.
-  // Verdicts still flow. Idempotent.
-  void stop_receiving();
+  std::uint64_t packets_received() const noexcept {
+    return _received.load(std::memory_order_relaxed);
+  }
+  std::uint64_t verdicts_issued() const noexcept {
+    return _verdicted.load(std::memory_order_relaxed);
+  }
 
-  // stop_receiving(), then drain every queued verdict to the kernel and join the
-  // verdict thread. Call once producers are quiesced. Idempotent; also run by
-  // the destructor.
-  void stop();
+  // Received but not yet verdicted -- what some flow is holding right now.
+  // Should stay small and keep coming back to zero. Growing without bound means
+  // packets are held and never released, which pins kernel queue slots and
+  // hangs those connections.
+  std::uint64_t outstanding() const noexcept {
+    return packets_received() - verdicts_issued();
+  }
 
-  // Async-signal-safe: nudges the receive loop to exit, nothing more. Safe to
-  // call from a signal handler; pair it with wait() + stop() on the main thread.
-  void request_stop() noexcept;
-
-  // --- verdicts ------------------------------------------------------------
-
-  // Stamp `v` on the packet and hand it to the verdict thread. Releases the
-  // packet's bytes first, so only a 32-byte shell crosses the queue and the
-  // buffer is freed here, on the calling thread. Thread-safe, lock-free, and
-  // never blocks.
-  void submit(Packet &&pkt, Verdict v) override;
-
-  // Same for a whole flow's packets, in one bulk enqueue. Leaves `pkts` empty.
-  void submit(std::vector<Packet> &&pkts, Verdict v) override;
-
-  // --- diagnostics ---------------------------------------------------------
-
-  // Verdicts accepted but not yet written to the kernel. Approximate.
-  std::size_t pending_verdicts() const noexcept;
-
-  // Packets the callback returned without submitting, which we allowed as a
-  // fail-safe. Any nonzero value is a bug in the callback.
+  // Packets the callback neither verdicted nor took ownership of; we allow them
+  // rather than strand a queue slot. Moving a packet into per-flow state clears
+  // its pending flag, so held packets are NOT counted here -- any nonzero value
+  // is a real bug in the callback.
   std::uint64_t packets_undecided() const noexcept {
     return _undecided.load(std::memory_order_relaxed);
   }
 
-  // Set once the receive loop has aborted. error() then describes why; it is
-  // empty while things are healthy.
+  // True once the receive path has given up; error() then says why.
   bool failed() const noexcept {
     return _err_errno.load(std::memory_order_acquire) != 0;
   }
   std::string error() const;
 
+  std::uint16_t queue_num() const noexcept { return _queue_num; }
+
 private:
-  static int trampoline(nfq_q_handle *qh, nfgenmsg *nfmsg, nfq_data *nfa,
-                        void *self);
+  // libnetfilter_queue can only call a plain C-style function, so it calls this
+  // one, and we get the instance back out of the user pointer we registered in
+  // the constructor. It does nothing else -- all the work is in handle().
+  static int on_packet(nfq_q_handle *qh, nfgenmsg *nfmsg, nfq_data *nfa,
+                       void *user);
+
+  // The real per-packet work: pull out the id and bytes, wrap them in a Packet
+  // and hand it to the callback.
   int handle(nfq_data *nfa);
-
-  void recv_loop();
-  void verdict_loop();
-
-  // Issue one verdict to the kernel. Verdict-thread only: libnetfilter_queue
-  // bumps a non-atomic sequence counter on the handle, so this must stay
-  // single-writer.
-  void issue(std::uint32_t id, Verdict v);
 
   void record_error(const char *what, int err) noexcept;
 
-  nfq_handle *h_ = nullptr;
-  nfq_q_handle *qh_ = nullptr;
-  Callback cb_;
-  std::vector<char> buf_;
-  std::uint16_t queueNum_;
+  nfq_handle *_h = nullptr;
+  nfq_q_handle *_qh = nullptr;
+  Callback _cb;
+  std::vector<char> _buf;
+  std::uint16_t _queue_num;
+  int _stop_fd = -1; // borrowed, shared by all workers; never read or closed
 
-  // Shells awaiting a verdict syscall. Many producers, one consumer.
-  moodycamel::BlockingConcurrentQueue<Packet> _verdicts;
-
-  std::thread _recv_thread;
-  std::thread _verdict_thread;
-  int _stop_evt = -1; // eventfd: wakes the receive loop out of poll()
-  std::atomic<bool> _draining{false};
-  bool _started = false;
-
+  std::atomic<std::uint64_t> _received{0};
+  std::atomic<std::uint64_t> _verdicted{0};
   std::atomic<std::uint64_t> _undecided{0};
-  // errno of the failure, 0 while healthy; `_err_what` is always a literal, so
-  // there is no lifetime to manage. Publish _err_what before _err_errno.
+
+  // errno of the failure, 0 while healthy. `_err_what` is always a string
+  // literal, so there is no lifetime to manage. Publish it before _err_errno.
   std::atomic<int> _err_errno{0};
   std::atomic<const char *> _err_what{nullptr};
 };

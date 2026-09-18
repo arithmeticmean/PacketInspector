@@ -83,21 +83,27 @@ constexpr int8_t kClientSide = 0;
 //   NeedMore -> keep buffering; call again after the next reassembled chunk
 enum class HostnameResult : uint8_t { Found, NotFound, NeedMore };
 
-// Extract the hostname (TLS SNI host_name) from the reassembled client->server
-// TCP stream. `tls_data`/`len` start at the TLS record layer and may hold only
-// part of the ClientHello (hence NeedMore). Zero-copy on Found:
-// `host`/`host_len` point inside `tls_data` (not NUL-terminated; valid only
-// while that buffer lives). Assumes the ClientHello fits one TLS record (the
-// normal case). Never allocates; every read is bounds-checked.
-HostnameResult extractHostname(const uint8_t *tls_data, uint32_t len,
-                               const uint8_t *&host,
-                               uint32_t &host_len) noexcept {
-  const uint8_t *p = tls_data;
-  auto rd16 = [](const uint8_t *q) noexcept -> uint16_t {
-    return static_cast<uint16_t>((static_cast<uint16_t>(q[0]) << 8) | q[1]);
-  };
+// Byte-wise big-endian read. Callers bounds-check first.
+inline uint16_t rd16(const uint8_t *q) noexcept {
+  return static_cast<uint16_t>((static_cast<uint16_t>(q[0]) << 8) | q[1]);
+}
 
-  // --- TLS record header: content_type(1) version(2) length(2) ---
+// Collect the complete handshake MESSAGE out of the record layer.
+//
+// TLS frames twice: records carry handshake messages, and RFC 8446 s5.1 allows
+// one message to be "fragmented across several records". So the ClientHello is
+// not necessarily the payload of a single record -- treating it that way reads
+// the next record's 5-byte header as message body, desynchronises the walk, and
+// (because we fail open) lets the flow through unfiltered. That is a bypass
+// anyone can trigger deliberately, so the record layer is stripped first.
+//
+// On Found, `hs`/`hs_len` point at the message: at the stream itself when one
+// record holds the whole thing (the overwhelmingly common case, zero copy), or
+// at `scratch` when the payloads had to be joined.
+HostnameResult collectHandshake(const uint8_t *p, uint32_t len,
+                                std::vector<uint8_t> &scratch,
+                                const uint8_t *&hs, uint32_t &hs_len) noexcept {
+  // --- first record header: content_type(1) version(2) length(2) ---
   if (len < 1)
     return HostnameResult::NeedMore;
   if (p[0] != 0x16) // not a handshake record -> never a ClientHello
@@ -105,30 +111,89 @@ HostnameResult extractHostname(const uint8_t *tls_data, uint32_t len,
   if (len >= 2 && p[1] != 0x03) // TLS/SSL3 share major 3
     return HostnameResult::NotFound;
   if (len < 5)
-    return HostnameResult::NeedMore; // valid handshake-record prefix, need more
+    return HostnameResult::NeedMore;
 
-  const uint16_t rec_len = rd16(p + 3);
-  if (rec_len == 0 || rec_len > 16384) // TLSPlaintext.length cap = 2^14
+  const uint32_t rec0 = rd16(p + 3);
+  if (rec0 == 0 || rec0 > 16384) // TLSPlaintext.length cap = 2^14
     return HostnameResult::NotFound;
 
-  // --- Handshake header: msg_type(1) length(3) ---
-  if (len < 9)
-    return HostnameResult::NeedMore; // have the record header, need the hs
-                                     // header
-  if (p[5] != 0x01) // not a ClientHello (e.g. ServerHello 0x02)
-    return HostnameResult::NotFound;
-  const uint32_t hs_len = (static_cast<uint32_t>(p[6]) << 16) |
-                          (static_cast<uint32_t>(p[7]) << 8) | p[8];
-  if (hs_len < 34 ||
-      hs_len > 65535) // legacy_version+random floor; sane ceiling
-    return HostnameResult::NotFound;
+  // Fast path: the first record holds at least the handshake header AND the
+  // whole message. That is all real traffic, and it costs no copy.
+  //
+  // The rec0 >= 4 guard matters: with fewer than four payload bytes in record
+  // one, p[6..8] is not the handshake length at all -- it is the NEXT record's
+  // header. Reading it would produce a garbage length from attacker-chosen
+  // bytes, which is exactly the kind of split an evasion tool picks.
+  if (rec0 >= 4 && len >= 9) {
+    if (p[5] != 0x01) // not a ClientHello (e.g. ServerHello 0x02)
+      return HostnameResult::NotFound;
+    const uint32_t msg_len = (static_cast<uint32_t>(p[6]) << 16) |
+                             (static_cast<uint32_t>(p[7]) << 8) | p[8];
+    if (msg_len < 34 || msg_len > 65535) // random floor; sane ceiling
+      return HostnameResult::NotFound;
+    const uint32_t want = 4u + msg_len;
+    if (want <= rec0) {
+      if (len < 5u + want)
+        return HostnameResult::NeedMore;
+      hs = p + 5;
+      hs_len = want;
+      return HostnameResult::Found;
+    }
+  }
 
-  const uint32_t body_end = 9u + hs_len; // record hdr(5) + hs hdr(4) + body
-  if (len < body_end)
-    return HostnameResult::NeedMore; // full ClientHello not reassembled yet
+  // Fragmented. Join record payloads, discovering the handshake header only
+  // once four bytes of it have actually accumulated -- it can itself straddle a
+  // record boundary, so it cannot be read from the first record up front.
+  scratch.clear();
+  uint32_t off = 0;
+  uint32_t want = 0; // 0 = message length not known yet
 
-  // --- Complete ClientHello body [9, body_end): walk to server_name ---
-  uint32_t o = 9;
+  while (want == 0 || scratch.size() < want) {
+    if (len - off < 5)
+      return HostnameResult::NeedMore; // partial record header
+    if (p[off] != 0x16 || p[off + 1] != 0x03)
+      return HostnameResult::NotFound; // alert/app-data mid-handshake
+    const uint32_t rl = rd16(p + off + 3);
+    if (rl == 0 || rl > 16384)
+      return HostnameResult::NotFound;
+    if (len - off - 5 < rl)
+      return HostnameResult::NeedMore; // record announced but not yet arrived
+
+    scratch.insert(scratch.end(), p + off + 5, p + off + 5 + rl);
+    off += 5 + rl;
+
+    if (want == 0 && scratch.size() >= 4) {
+      if (scratch[0] != 0x01)
+        return HostnameResult::NotFound;
+      const uint32_t msg_len = (static_cast<uint32_t>(scratch[1]) << 16) |
+                               (static_cast<uint32_t>(scratch[2]) << 8) |
+                               scratch[3];
+      if (msg_len < 34 || msg_len > 65535)
+        return HostnameResult::NotFound;
+      want = 4u + msg_len;
+    }
+
+    if (off >= len && (want == 0 || scratch.size() < want))
+      return HostnameResult::NeedMore;
+  }
+
+  hs = scratch.data();
+  hs_len = want;
+  return HostnameResult::Found;
+}
+
+// Parse the SNI host_name out of a complete ClientHello handshake message --
+// msg_type(1) length(3) body -- with the record layer already stripped.
+// Zero-copy on Found: host/host_len point inside `hs`. Every read is bounds
+// checked; never allocates.
+HostnameResult parseClientHello(const uint8_t *p, uint32_t len,
+                                const uint8_t *&host,
+                                uint32_t &host_len) noexcept {
+  if (len < 4 || p[0] != 0x01)
+    return HostnameResult::NotFound;
+  const uint32_t body_end = len;
+
+  uint32_t o = 4; // past msg_type(1) + length(3)
   auto have = [&](uint32_t k) noexcept { return o + k <= body_end; };
 
   // legacy_version(2) + random(32) + session_id_len(1).
@@ -192,17 +257,30 @@ HostnameResult extractHostname(const uint8_t *tls_data, uint32_t len,
   return HostnameResult::NotFound; // no server_name extension
 }
 
+// Strip the record layer, then parse the ClientHello inside it.
+HostnameResult extractHostname(const uint8_t *tls_data, uint32_t len,
+                               std::vector<uint8_t> &scratch,
+                               const uint8_t *&host,
+                               uint32_t &host_len) noexcept {
+  const uint8_t *hs = nullptr;
+  uint32_t hs_len = 0;
+  const HostnameResult r = collectHandshake(tls_data, len, scratch, hs, hs_len);
+  if (r != HostnameResult::Found)
+    return r;
+  return parseClientHello(hs, hs_len, host, host_len);
+}
+
 } // namespace
 
 // Out-of-line to anchor the vtable in this translation unit.
 HostnameExtractor::~HostnameExtractor() = default;
 
 TcpTlsHostnameExtractor::TcpTlsHostnameExtractor(Decide decide,
-                                                 VerdictSink &sink,
                                                  std::size_t max_flows,
                                                  std::size_t max_blocked)
-    : _decide(std::move(decide)), _sink(sink),
-      _reassembly(&TcpTlsHostnameExtractor::onMessageReady, this, nullptr,
+    : _decide(std::move(decide)),
+      _reassembly(&TcpTlsHostnameExtractor::onMessageReady, this,
+                  &TcpTlsHostnameExtractor::onConnectionStart,
                   &TcpTlsHostnameExtractor::onConnectionEnd,
                   pcpp::TcpReassemblyConfiguration(
                       /*removeConnInfo=*/true, kPcppClosedDelaySec,
@@ -258,10 +336,6 @@ bool TcpTlsHostnameExtractor::evict_oldest_blocked() {
   return false;
 }
 
-void TcpTlsHostnameExtractor::sink_one(Packet &&pkt, Verdict v) {
-  _sink.submit(std::move(pkt), v);
-}
-
 void TcpTlsHostnameExtractor::feed(Packet pkt) {
   // Republish the table size however we leave -- feed() has a lot of early
   // returns, and a counter that is only right on some of them is worse than no
@@ -279,7 +353,7 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
   // about. (The receive thread already filters these out; this is the backstop
   // for a packet that slipped through.)
   if (!pkt.has_bytes() || !pkt.flow_view(f) || f.ip_proto != kProtoTcp) {
-    sink_one(std::move(pkt), Verdict::ALLOW);
+    decide(std::move(pkt), Verdict::ALLOW);
     return;
   }
 
@@ -290,7 +364,7 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
   // pcpp::Packet is built on this path.
   if (it != _conns.end() && it->second.state == State::Block) {
     it->second.last = now;
-    sink_one(std::move(pkt), Verdict::BLOCK);
+    decide(std::move(pkt), Verdict::BLOCK);
     return;
   }
 
@@ -303,7 +377,7 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
     // Anything else on an untracked flow tells us nothing. This is the common
     // case for the bulk of traffic: one failed hash lookup and a flags test.
     if (!isClientSyn(f) && !opensTlsHandshake(f.payload, f.payload_len)) {
-      sink_one(std::move(pkt), Verdict::ALLOW);
+      decide(std::move(pkt), Verdict::ALLOW);
       return;
     }
     if (_conns.size() >= _max_flows) {
@@ -324,7 +398,7 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
         evict_oldest_blocked();
       if (_conns.size() >= _max_flows) {
         _dropped_at_cap.fetch_add(1, std::memory_order_relaxed);
-        sink_one(std::move(pkt), Verdict::ALLOW);
+        decide(std::move(pkt), Verdict::ALLOW);
         return;
       }
     }
@@ -336,7 +410,7 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
 
   if (c.held.size() >= kMaxPacketsPerConn) {
     resolve(key, std::nullopt); // flooded without a decision -> give up
-    sink_one(std::move(pkt), Verdict::ALLOW);
+    decide(std::move(pkt), Verdict::ALLOW);
     return;
   }
 
@@ -349,7 +423,7 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
   // connection end is seen promptly rather than waiting for the idle sweep.
   const bool hold = f.payload_len > 0;
   if (!hold && (f.tcp_flags & (kTcpSyn | kTcpFin | kTcpRst)) == 0) {
-    sink_one(std::move(pkt), Verdict::ALLOW);
+    decide(std::move(pkt), Verdict::ALLOW);
     return;
   }
 
@@ -376,13 +450,13 @@ void TcpTlsHostnameExtractor::feed(Packet pkt) {
 
   if (hold) {
     // Reassembled, so the bytes have done their job -- drop them and keep the
-    // shell. If the flow resolved during the call the packet is already at the
-    // sink, which released it there.
+    // shell. If the flow resolved during the call the packet is already in the
+    // decided buffer and is no longer held here.
     auto still = _conns.find(key);
     if (still != _conns.end() && !still->second.held.empty())
       still->second.held.back().release_bytes();
   } else {
-    sink_one(std::move(pkt), Verdict::ALLOW);
+    decide(std::move(pkt), Verdict::ALLOW);
   }
 }
 
@@ -416,6 +490,20 @@ void TcpTlsHostnameExtractor::drain_closes() {
 // Both callbacks fire synchronously from inside reassemblePacket(), for the
 // connection whose packet we just fed -- so `_current_key` identifies the flow
 // and pcpp's own connection identity is never used to look up our state.
+// pcpp has just created state for this connection. This is the earliest -- and
+// for a flow that never sends payload, the only -- point at which we learn its
+// key, and without the key resolve() cannot close it and pcpp never reclaims it.
+void TcpTlsHostnameExtractor::onConnectionStart(const pcpp::ConnectionData &conn,
+                                                void *cookie) {
+  auto *self = static_cast<TcpTlsHostnameExtractor *>(cookie);
+  if (!self->_feeding)
+    return;
+  auto it = self->_conns.find(self->_current_key);
+  if (it == self->_conns.end())
+    return;
+  it->second.pcpp_key = conn.flowKey;
+}
+
 void TcpTlsHostnameExtractor::onMessageReady(int8_t side,
                                              const pcpp::TcpStreamData &data,
                                              void *cookie) {
@@ -440,8 +528,8 @@ void TcpTlsHostnameExtractor::onMessageReady(int8_t side,
   const uint8_t *host = nullptr;
   uint32_t host_len = 0;
   switch (extractHostname(c.stream.data(),
-                          static_cast<uint32_t>(c.stream.size()), host,
-                          host_len)) {
+                          static_cast<uint32_t>(c.stream.size()),
+                          self->_hs_scratch, host, host_len)) {
   case HostnameResult::Found:
     self->resolve(self->_current_key,
                   std::string(reinterpret_cast<const char *>(host), host_len));
@@ -509,7 +597,9 @@ void TcpTlsHostnameExtractor::resolve(uint32_t key,
   if (token != 0 && !closed)
     _to_close.push_back(token);
 
-  _sink.submit(std::move(held), v);
+  // Everything this flow was holding gets the same verdict, in arrival order.
+  for (Packet &p : held)
+    decide(std::move(p), v);
 }
 
 void TcpTlsHostnameExtractor::sweep(std::chrono::steady_clock::time_point now) {
